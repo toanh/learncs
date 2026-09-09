@@ -354,11 +354,13 @@ function draw(){
   for (j = 0; j < P.length; j++){ var q = state(P[j], s); L.push({ p: P[j], q: q, pr: project(q.x, q.y, q.z) }); }
   L.sort(function(A, B){ return A.pr.d - B.pr.d; });
   var ds = 0.035*tau;
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
   for (j = 0; j < L.length; j++){
     var it = L[j], mix = Math.max(0, Math.min(1, (it.q.w - 0.5)/1.8));
-    var R = Math.round(29 + 210*mix), G = Math.round(158 + mix), B2 = Math.round(117 - 78*mix);
-    ctx.strokeStyle = 'rgba(' + R + ',' + G + ',' + B2 + ',' + Math.max(0.14, Math.min(0.9, it.pr.sc*0.5)) + ')';
-    ctx.lineWidth = Math.max(0.6, 1.3*it.pr.sc);
+    mix = mix*mix*(3 - 2*mix);          /* push inner/outer apart, thin the middle */
+    var R = Math.round(38 + 217*mix), G = Math.round(190 - 84*mix), B2 = Math.round(235 - 209*mix);
+    ctx.strokeStyle = 'rgba(' + R + ',' + G + ',' + B2 + ',' + Math.max(0.22, Math.min(0.95, it.pr.sc*0.55)) + ')';
+    ctx.lineWidth = Math.max(1.7, 3.1*it.pr.sc);
     ctx.beginPath(); ctx.moveTo(it.pr.px, it.pr.py);
     for (var k = 1; k < 6; k++){
       var qq = state(it.p, Math.max(0, s - k*ds)), pp = project(qq.x, qq.y, qq.z);
