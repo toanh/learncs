@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Velocity Grid</title>
+<style>
+  :root{
+    --bg:#060F13;
+    --tank:#08151B;
+    --line:#1C2F38;
+    --text:#D6E2E7;
+    --dim:#7B959F;
+    --ui:"Helvetica Neue",Helvetica,Arial,sans-serif;
+    --mono:"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0;overflow:hidden}
+  body{background:var(--bg);color:var(--text);font-family:var(--ui);font-size:13px}
+  section{height:100%;display:grid;grid-template-rows:auto 1fr auto;padding:12px 16px 10px}
+  h2{font-size:15px;font-weight:500;margin:0 0 8px}
+  h2 small{font-size:13px;color:var(--dim);font-weight:400;margin-left:10px}
+  .key-force{color:#EF9F27}
+  .stage{position:relative;min-height:0;background:var(--tank);border-radius:2px;overflow:hidden}
+  canvas{display:block;width:100%;height:100%;touch-action:none;cursor:crosshair}
+  .bar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding-top:9px;color:var(--dim)}
+  label.chk{display:flex;align-items:center;gap:6px;cursor:pointer;white-space:nowrap}
+  label.chk input{width:14px;height:14px;accent-color:#56C7E0;margin:0}
+  button{font:inherit;color:var(--text);background:transparent;border:1px solid var(--line);border-radius:2px;padding:4px 11px;cursor:pointer}
+  button:hover{background:var(--line)}
+  :focus-visible{outline:2px solid #56C7E0;outline-offset:2px}
+  input[type=range]{flex:1;min-width:80px;accent-color:#56C7E0;height:18px}
+  .num{font-family:var(--mono);color:var(--text);font-variant-numeric:tabular-nums}
+  .warn{color:#EF9F27}
+</style>
+</head>
+<body>
+<section>
+  <h2>Push the fluid, watch the velocity field
+    <small>white arrow = velocity in a cell · <span class="key-force">orange arrow = your force this step</span> · lengths are relative to the largest</small></h2>
+  <div class="stage"><canvas id="tank" aria-label="Velocity grid. Drag to push the fluid."></canvas></div>
+  <div class="bar">
+    <label class="chk"><input type="checkbox" id="cAdv" checked />Advection</label>
+    <label class="chk"><input type="checkbox" id="cDif" checked />Viscosity</label>
+    <label class="chk"><input type="checkbox" id="cPrj" checked />Pressure</label>
+    <button id="bPause" style="min-width:70px">Pause</button>
+    <button id="bStep">Step</button>
+    <button id="bStir">Stir</button>
+    <button id="bReset">Reset</button>
+    <label class="chk" style="flex:1;min-width:150px">ν <input type="range" id="sVisc" min="0" max="100" step="1" value="20" aria-label="Viscosity" /><span class="num" id="oVisc">0.000020</span></label>
+    <span>∇·u <span class="num" id="oDiv">0.00</span></span>
+    <span>‖u‖ <span class="num" id="oSpd">0.0</span></span>
+  </div>
+</section>
+
+<script>
+/* A stripped-down version of the left panel of index.html. Same solver, but
+   instead of floating tracer particles through the flow, every grid cell is
+   drawn directly: its colour is its speed and its arrow is its velocity
+   vector. The force you add by dragging is drawn as an orange arrow in the
+   cells it lands on, so you can see a push go in and then watch the
+   pressure, viscosity and advection stages spread it to the neighbours.
+
+   Pause, then drag: the force is held (orange) without being applied. Press
+   Step to run exactly one time step and see what it does to the white arrows.
+
+   WHAT THE NAVIER-STOKES EQUATIONS SAY
+
+   The fluid is described by a velocity field u(x,y,t): at every point of the
+   tank, and at every instant, there is an arrow saying which way the fluid is
+   moving and how fast. Navier-Stokes is just Newton's F = ma written for that
+   field of arrows, once for each point:
+
+       du/dt  =  -(u . grad)u  -  grad(p)  +  nu * lap(u)  +  f      ... (1)
+       div(u) =  0                                                   ... (2)
+
+   Bold-vs-plain warning: "u" means two things in this file. In the equations
+   it is the whole velocity vector, u = (u, v). In the code, the arrays u and v
+   are its two components - horizontal speed and vertical speed.
+
+   Reading the symbols:
+
+     du/dt      how the velocity at a fixed point changes from instant to
+                instant - the "a" in F = ma (density is taken as 1).
+
+     grad       the operator (d/dx, d/dy). grad(q) is the "slope vector" of q:
+                it points uphill, in the direction q increases fastest.
+
+     div(u)     du/dx + dv/dy. How much fluid is spreading out of a point:
+                positive is a source, negative a sink.
+
+     lap(u)     d2u/dx2 + d2u/dy2. Negative at a peak, positive in a dip, so it
+                always pulls a value toward the average of its neighbours - it
+                is the smoothing operator.
+
+   Term by term, the velocity at a point changes because of:
+
+     -(u . grad)u   ADVECTION. (u . grad) = u*d/dx + v*d/dy is "the rate of
+                    change as you ride along with the flow". Applied to u
+                    itself it says the fluid carries its own velocity along,
+                    the way a river carries a leaf. u appears twice, which
+                    makes this the one nonlinear term, and the hard one.
+
+     -grad(p)       PRESSURE. Fluid accelerates from high pressure toward low.
+                    p is whatever it has to be to keep equation (2) true.
+
+     nu * lap(u)    VISCOSITY. Internal friction: neighbouring cells drag on
+                    each other, so velocity smooths out. nu is the slider.
+
+     f              EXTERNAL FORCE. Your mouse - see push().
+
+   Equation (2) is INCOMPRESSIBILITY: what flows into a region must flow out,
+   so the divergence is zero everywhere. The "div.u" readout shows how close
+   to zero we are.
+
+   HOW THE CODE SOLVES IT
+
+     1. Space is chopped into an N x N grid; u[] and v[] hold the velocity at
+        the centre of each cell. Derivatives become differences between
+        neighbours, e.g. du/dx at cell i is about (u[i+1] - u[i-1]) / (2h),
+        where h = 1/N is the cell width.
+
+     2. Time advances in steps of dt, and each step applies the terms of (1)
+        one after another (a "splitting" method). One velStep() does:
+
+             add force  ->  viscosity  ->  pressure  ->  advect  ->  pressure
+
+        This is Jos Stam's "Stable Fluids" (1999): it never explodes, however
+        big dt is.
+*/
+
+/* ---------------- the grid ---------------- */
+
+/* N x N cells that hold the fluid, plus a one-cell ring of "ghost" cells all
+   the way round that hold the wall conditions, so arrays are (N+2) x (N+2).
+   N is small here so each cell is big enough to draw an arrow in; the physics
+   works the same at any N (index.html uses 110). */
+const N = 32;
+const W = N + 2;          // row width, including the two ghost cells
+const SIZE = W * W;
+const ITER = 16;          // sweeps of the iterative solver, see linSolve()
+const dt = 0.11;          // length of one time step
+let visc = 0.00002;       // nu, the viscosity
+
+/* The grid is one flat array, stored row after row. IX turns (column, row)
+   into an index, so a cell's four neighbours are at id-1, id+1, id-W, id+W. */
+function IX(i, j){ return i + W * j; }
+
+const u  = new Float32Array(SIZE);   // velocity, horizontal component
+const v  = new Float32Array(SIZE);   // velocity, vertical component
+const fu = new Float32Array(SIZE);   // force from the mouse, horizontal
+const fv = new Float32Array(SIZE);   // force from the mouse, vertical
+const u0 = new Float32Array(SIZE);   // scratch: copy of u before a stage
+const v0 = new Float32Array(SIZE);   // scratch: copy of v before a stage
+const pressure   = new Float32Array(SIZE);
+const divergence = new Float32Array(SIZE);
+
+/* ---------------- the physics ---------------- */
+
+/* BOUNDARY CONDITIONS - the walls of the tank.
+
+   Fluid cannot flow through a solid wall, so the ghost cell just outside a
+   wall is filled in to force that:
+
+     HORIZONTAL  the array is u, and this is a left/right wall: copy the
+                 neighbour with the sign flipped. The average of x and -x is 0,
+                 so no flow crosses the wall - it bounces.
+     VERTICAL    the same for v at the top/bottom walls.
+     SCALAR      pressure or divergence: nothing to reflect, so copy the
+                 neighbour unchanged ("no slope across the wall").
+
+   Corner cells take the average of their two neighbours. Every stage calls
+   this at the end, otherwise the edges would leak. */
+const SCALAR = 0, HORIZONTAL = 1, VERTICAL = 2;
+
+function setWalls(kind, x){
+  for (let i = 1; i <= N; i++){
+    const flipX = kind === HORIZONTAL ? -1 : 1;
+    const flipY = kind === VERTICAL   ? -1 : 1;
+    x[IX(0, i)]     = flipX * x[IX(1, i)];   // left wall
+    x[IX(N + 1, i)] = flipX * x[IX(N, i)];   // right wall
+    x[IX(i, 0)]     = flipY * x[IX(i, 1)];   // top wall
+    x[IX(i, N + 1)] = flipY * x[IX(i, N)];   // bottom wall
+  }
+  x[IX(0, 0)]         = 0.5 * (x[IX(1, 0)]     + x[IX(0, 1)]);
+  x[IX(0, N + 1)]     = 0.5 * (x[IX(1, N + 1)] + x[IX(0, N)]);
+  x[IX(N + 1, 0)]     = 0.5 * (x[IX(N, 0)]     + x[IX(N + 1, 1)]);
+  x[IX(N + 1, N + 1)] = 0.5 * (x[IX(N, N + 1)] + x[IX(N + 1, N)]);
+}
+
+/* SOLVING FOR A FIELD THAT DEPENDS ON ITS OWN NEIGHBOURS.
+
+   Both the viscosity and pressure stages need a value in every cell such that
+
+       x[cell] * c  =  known[cell]  +  a * (sum of x at the four neighbours)
+
+   Every cell depends on cells not yet worked out - N*N simultaneous
+   equations. Instead of solving them exactly, guess and improve (Gauss-Seidel
+   relaxation): sweep the grid, recompute each cell from its neighbours, fix
+   the walls, repeat ITER times. The values settle toward the true answer.
+
+   The sweep is in place, so each cell sees neighbours that were already
+   updated this sweep (left, above) and ones that were not (right, below).
+   That makes new information travel faster than reading only old values
+   (Jacobi iteration) would - about twice as fast - at the cost of a slight
+   bias toward the sweep direction, invisible at this scale.
+
+   a and c are set differently for viscosity and pressure; see the callers. */
+function linSolve(kind, x, known, a, c){
+  for (let k = 0; k < ITER; k++){
+    for (let j = 1; j <= N; j++){
+      for (let i = 1; i <= N; i++){
+        const id = IX(i, j);
+        const neighbours = x[id - 1] + x[id + 1] + x[id - W] + x[id + W];
+        x[id] = (known[id] + a * neighbours) / c;
+      }
+    }
+    setWalls(kind, x);
+  }
+}
+
+/* VISCOSITY - the nu * lap(u) term. Checkbox: Viscosity.
+
+   The naive update, u_new = u_old + dt*nu*lap(u_old), overshoots and
+   oscillates when dt or nu is large. So solve it IMPLICITLY: find the new
+   field that, diffused backwards by one step, gives the old one:
+
+       u_new - dt*nu*lap(u_new) = u_old
+
+   That is exactly linSolve's problem with a = dt*nu*N*N (N*N converts nu into
+   grid-cell units, since lap has a 1/h^2 in it) and c = 1 + 4a. It can only
+   smooth, never overshoot. */
+function diffuse(kind, x, old){
+  const a = dt * visc * N * N;
+  linSolve(kind, x, old, a, 1 + 4 * a);
+}
+
+/* ADVECTION - the -(u . grad)u term. Checkbox: Advection.
+
+   Pushing each cell's value forward along the flow scatters values between
+   cells and blows up for large dt. Stam's trick is to look BACKWARDS:
+
+     For cell (i,j), ask where the fluid now arriving here was one step ago:
+     at (i,j) minus velocity * dt. Copy the old value from that spot.
+
+   That spot is rarely a cell centre, so the value is read by bilinear
+   interpolation - a weighted average of the four surrounding cells. Every new
+   value is an average of old ones, so nothing can grow without bound. That
+   is why the solver is "stable".
+
+   `old` is the field being carried; (carryU, carryV) is the velocity that
+   carries it. dt*N converts a velocity in tank-widths per second into a
+   distance in cells. The clamp keeps the back-traced point inside the grid. */
+function advect(kind, x, old, carryU, carryV){
+  const cellsPerStep = dt * N;
+  for (let j = 1; j <= N; j++){
+    for (let i = 1; i <= N; i++){
+      const id = IX(i, j);
+      /* step backwards down the velocity arrow to find where this came from */
+      const fromX = clamp(i - cellsPerStep * carryU[id], 0.5, N + 0.5);
+      const fromY = clamp(j - cellsPerStep * carryV[id], 0.5, N + 0.5);
+      x[id] = sampleAt(old, fromX, fromY);
+    }
+  }
+  setWalls(kind, x);
+}
+
+/* Bilinear interpolation: the value of field f at a point (x, y) given in
+   cell units. (i0, j0) is the cell to the upper-left of the point; s and t
+   are how far past it the point sits, across and down (0..1). Each of the four
+   cells is weighted by how close the point is to it. */
+function sampleAt(f, x, y){
+  const i0 = Math.floor(x), j0 = Math.floor(y);
+  const s = x - i0, t = y - j0;
+  const top    = (1 - s) * f[IX(i0, j0)]     + s * f[IX(i0 + 1, j0)];
+  const bottom = (1 - s) * f[IX(i0, j0 + 1)] + s * f[IX(i0 + 1, j0 + 1)];
+  return (1 - t) * top + t * bottom;
+}
+
+/* PRESSURE - the -grad(p) term, and how equation (2) is enforced.
+   Checkbox: Pressure.
+
+   After the other stages the field has sources and sinks, div(u) != 0. Any
+   velocity field can be split into exactly two parts (Helmholtz):
+
+       (what we have)  =  (a divergence-free swirl)  +  grad(p)
+
+   so compute p and subtract grad(p), and what is left is divergence-free.
+   This is a "projection": drop the illegal component, keep the legal one.
+   Untick Pressure and watch the arrows point into and out of blobs instead
+   of circulating.
+
+     1. Measure div(u) in every cell with centred differences. The factor -h
+        is folded in so that step 2 gets tidy coefficients.
+     2. Solve lap(p) = div(u) for p - linSolve again, with a = 1, c = 4.
+     3. Subtract grad(p): each cell is pushed from high pressure toward low,
+        so fluid piling up is pushed apart and thinning fluid is pulled in. */
+function project(){
+  const h = 1 / N;
+  for (let j = 1; j <= N; j++){
+    for (let i = 1; i <= N; i++){
+      const du_dx = u[IX(i + 1, j)] - u[IX(i - 1, j)];
+      const dv_dy = v[IX(i, j + 1)] - v[IX(i, j - 1)];
+      divergence[IX(i, j)] = -0.5 * h * (du_dx + dv_dy);
+      pressure[IX(i, j)] = 0;
+    }
+  }
+  setWalls(SCALAR, divergence);
+  setWalls(SCALAR, pressure);
+
+  linSolve(SCALAR, pressure, divergence, 1, 4);
+
+  for (let j = 1; j <= N; j++){
+    for (let i = 1; i <= N; i++){
+      u[IX(i, j)] -= 0.5 * (pressure[IX(i + 1, j)] - pressure[IX(i - 1, j)]) / h;
+      v[IX(i, j)] -= 0.5 * (pressure[IX(i, j + 1)] - pressure[IX(i, j - 1)]) / h;
+    }
+  }
+  setWalls(HORIZONTAL, u);
+  setWalls(VERTICAL, v);
+}
+
+/* ONE TIME STEP OF NAVIER-STOKES - the whole of equation (1), one term at a
+   time. Reading top to bottom is reading the equation. Where a stage needs
+   the complete "before" field while it writes the "after" field, the before
+   is copied into u0,v0 first. */
+function velStep(){
+  /* f: du/dt = f integrates to u += dt * f */
+  for (let i = 0; i < SIZE; i++){
+    u[i] += dt * fu[i];
+    v[i] += dt * fv[i];
+  }
+
+  /* nu * lap(u) */
+  if (cDif.checked){
+    u0.set(u); v0.set(v);
+    diffuse(HORIZONTAL, u, u0);
+    diffuse(VERTICAL, v, v0);
+  }
+
+  /* -grad(p), first time: clean up the divergence the force and viscosity
+     left, so advection carries the flow along a field that conserves mass */
+  if (cPrj.checked) project();
+
+  /* -(u . grad)u: both components are carried by the SAME, pre-advection
+     velocity, which is why u0,v0 are the last two arguments both times */
+  if (cAdv.checked){
+    u0.set(u); v0.set(v);
+    advect(HORIZONTAL, u, u0, u0, v0);
+    advect(VERTICAL,   v, v0, u0, v0);
+  }
+
+  /* -grad(p), second time: advection's interpolation reintroduces some
+     divergence, so project again. What gets drawn has just been projected. */
+  if (cPrj.checked) project();
+
+  /* Not physics - a safety net. With Pressure off the field can get wild, so
+     clamp the speed and scrub any NaN rather than let one cell poison all. */
+  for (let i = 0; i < SIZE; i++){
+    u[i] = Number.isFinite(u[i]) ? clamp(u[i], -60, 60) : 0;
+    v[i] = Number.isFinite(v[i]) ? clamp(v[i], -60, 60) : 0;
+  }
+}
+
+function clamp(x, lo, hi){ return Math.min(hi, Math.max(lo, x)); }
+
+/* ---------------- your force ---------------- */
+
+/* TERM f - the external force, i.e. you.
+
+   (dx, dy) is how far the pointer moved since the last event, in tank widths;
+   it stands in for the direction and strength of the shove. It is added to
+   fu,fv, which build up until the next step applies them.
+
+   The push is spread over the 3x3 cells around the pointer with Gaussian
+   weights, w = e^(-r^2/2): strongest in the middle cell, fading outward. A
+   force on a single cell is a spike that the pressure step would mostly just
+   fight; a soft blob behaves like a finger dragged through water. */
+function push(x, y, dx, dy){
+  if (x < 0 || x > 1 || y < 0 || y > 1) return;
+  const STRENGTH = 900;
+  const ci = Math.floor(x * N) + 1, cj = Math.floor(y * N) + 1;   // cell under the pointer
+  for (let a = -1; a <= 1; a++){
+    for (let b = -1; b <= 1; b++){
+      const i = ci + a, j = cj + b;
+      if (i < 1 || i > N || j < 1 || j > N) continue;
+      const w = Math.exp(-(a * a + b * b) / 2);
+      fu[IX(i, j)] += dx * STRENGTH * w;
+      fv[IX(i, j)] += dy * STRENGTH * w;
+    }
+  }
+}
+
+/* Push at 40 points around a circle, each tangent to it ((-sin, cos) is
+   perpendicular to the radius (cos, sin)), which spins up one clean vortex. */
+function stir(){
+  for (let k = 0; k < 40; k++){
+    const angle = k / 40 * 2 * Math.PI;
+    push(0.5 + 0.3 * Math.cos(angle), 0.5 + 0.3 * Math.sin(angle),
+         -0.02 * Math.sin(angle), 0.02 * Math.cos(angle));
+  }
+}
+
+/* ---------------- drawing ---------------- */
+
+const canvas = document.getElementById('tank'), ctx = canvas.getContext('2d');
+let size = 300, gridLeft = 0, gridTop = 0;   // the square drawing area, in CSS pixels
+const dpr = Math.min(2, window.devicePixelRatio || 1);
+
+function resize(){
+  const r = canvas.parentNode.getBoundingClientRect();
+  canvas.width = r.width * dpr; canvas.height = r.height * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  size = Math.min(r.width, r.height);
+  gridLeft = (r.width - size) / 2; gridTop = (r.height - size) / 2;
+}
+new ResizeObserver(resize).observe(canvas.parentNode);
+
+/* Speeds range from 0 to ~60, but most of the interesting ones are under 5.
+   1 - e^(-x/ref) maps 0..infinity onto 0..1, roughly linear for small x and
+   flattening for big ones, so slow cells still get a visible arrow and fast
+   ones do not overflow their cell. */
+function squash(x, ref){ return 1 - Math.exp(-x / ref); }
+
+/* The largest vector (x[id], y[id]) anywhere on the grid. */
+function largest(x, y){
+  let most = 0;
+  for (let j = 1; j <= N; j++){
+    for (let i = 1; i <= N; i++) most = Math.max(most, Math.hypot(x[IX(i, j)], y[IX(i, j)]));
+  }
+  return most;
+}
+
+/* Draw an arrow centred on (cx, cy), pointing along (vx, vy).
+
+   Arrow lengths are RELATIVE: `biggest` is the largest vector on the grid this
+   frame, and its arrow is maxLen long. Everything else is scaled against it,
+   so the picture shows the shape of the field whether the fluid is crawling
+   or racing - read the actual top speed off the ||u|| readout.
+
+   The length goes as the square root of the ratio, not the ratio itself, so a
+   cell at 1/4 of the top speed gets a half-length arrow rather than a stub.
+   Cells under 1% of the top speed are skipped as noise. */
+function arrow(cx, cy, vx, vy, maxLen, biggest){
+  const mag = Math.hypot(vx, vy);
+  const ratio = mag / biggest;
+  if (!(ratio > 0.01)) return;   // also skips biggest = 0 (NaN)
+  const len = maxLen * Math.sqrt(ratio);
+  const dirX = vx / mag, dirY = vy / mag;
+  const tailX = cx - dirX * len / 2, tailY = cy - dirY * len / 2;
+  const tipX  = cx + dirX * len / 2, tipY  = cy + dirY * len / 2;
+
+  /* the shaft stops where the head starts, so the tip stays sharp */
+  const headLen = Math.min(len * 0.55, maxLen * 0.35), headHalfWidth = headLen * 0.6;
+  const baseX = tipX - dirX * headLen, baseY = tipY - dirY * headLen;
+  ctx.beginPath();
+  ctx.moveTo(tailX, tailY); ctx.lineTo(baseX, baseY);
+  ctx.stroke();
+
+  /* the head: a filled triangle. (-dirY, dirX) is perpendicular to the arrow */
+  ctx.beginPath();
+  ctx.moveTo(tipX, tipY);
+  ctx.lineTo(baseX - dirY * headHalfWidth, baseY + dirX * headHalfWidth);
+  ctx.lineTo(baseX + dirY * headHalfWidth, baseY - dirX * headHalfWidth);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function render(){
+  const r = canvas.parentNode.getBoundingClientRect();
+  ctx.fillStyle = '#060F13'; ctx.fillRect(0, 0, r.width, r.height);
+  const cell = size / N;
+  const cellX = i => gridLeft + (i - 1) * cell;   // grid column -> screen x of its left edge
+  const cellY = j => gridTop  + (j - 1) * cell;
+
+  /* 1. each cell's background: dark when still, bright teal when fast */
+  for (let j = 1; j <= N; j++){
+    for (let i = 1; i <= N; i++){
+      const t = squash(Math.hypot(u[IX(i, j)], v[IX(i, j)]), 4);
+      ctx.fillStyle = `rgb(${8 + 30 * t}, ${21 + 90 * t}, ${27 + 100 * t})`;
+      ctx.fillRect(cellX(i), cellY(j), cell - 1, cell - 1);   // -1 leaves a gridline gap
+    }
+  }
+
+  ctx.lineCap = 'round';
+
+  /* 2. the force waiting to be applied (orange), under the velocity arrows.
+     Scaled against the biggest force, separately from the velocities. */
+  const biggestForce = largest(fu, fv);
+  ctx.strokeStyle = ctx.fillStyle = '#EF9F27';
+  ctx.lineWidth = Math.max(2.5, cell * 0.14);
+  for (let j = 1; j <= N; j++){
+    for (let i = 1; i <= N; i++){
+      arrow(cellX(i) + cell / 2, cellY(j) + cell / 2, fu[IX(i, j)], fv[IX(i, j)], cell * 1.1, biggestForce);
+    }
+  }
+
+  /* 3. the velocity of every cell (white). The floor of 0.05 on the scale
+     stops near-still fluid from blowing tiny leftover motion up to full size. */
+  const biggestVelocity = Math.max(0.05, largest(u, v));
+  ctx.strokeStyle = ctx.fillStyle = 'rgb(236,244,247)';
+  ctx.lineWidth = Math.max(1.5, cell * 0.07);
+  for (let j = 1; j <= N; j++){
+    for (let i = 1; i <= N; i++){
+      arrow(cellX(i) + cell / 2, cellY(j) + cell / 2, u[IX(i, j)], v[IX(i, j)], cell * 1.0, biggestVelocity);
+    }
+  }
+}
+
+/* The readouts. div.u is the root-mean-square divergence over the grid
+   (squared first so positive and negative errors cannot cancel); equation (2)
+   says it should be 0, and it turns orange past 3. ||u|| is the top speed. */
+function measure(){
+  let sumSq = 0, maxSpeed = 0;
+  for (let j = 1; j <= N; j++){
+    for (let i = 1; i <= N; i++){
+      const id = IX(i, j);
+      const div = (u[id + 1] - u[id - 1] + v[id + W] - v[id - W]) * 0.5 * N;
+      sumSq += div * div;
+      maxSpeed = Math.max(maxSpeed, Math.hypot(u[id], v[id]));
+    }
+  }
+  const rms = Math.sqrt(sumSq / (N * N));
+  oDiv.textContent = rms.toFixed(2);
+  oDiv.className = rms > 3 ? 'num warn' : 'num';
+  oSpd.textContent = maxSpeed.toFixed(1);
+}
+
+/* ---------------- controls ---------------- */
+
+const $ = id => document.getElementById(id);
+const cAdv = $('cAdv'), cDif = $('cDif'), cPrj = $('cPrj');
+const oDiv = $('oDiv'), oSpd = $('oSpd'), sVisc = $('sVisc'), oVisc = $('oVisc');
+
+/* The slider is an exponent, because useful viscosities span several powers
+   of ten: position 0 -> nu = 0 (frictionless), 100 -> nu ~ 0.0025. */
+function readVisc(){
+  const t = sVisc.value / 100;
+  visc = t === 0 ? 0 : 0.000001 * Math.pow(10, t * 3.4);
+  oVisc.textContent = visc.toFixed(6);
+}
+sVisc.addEventListener('input', readVisc);
+readVisc();
+
+/* Dragging pushes the fluid; pointer position is converted to 0..1 tank units */
+let dragging = false, lastX = 0, lastY = 0;
+function toTank(e){
+  const r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left - gridLeft) / size, y: (e.clientY - r.top - gridTop) / size };
+}
+canvas.addEventListener('pointerdown', e => {
+  dragging = true;
+  ({ x: lastX, y: lastY } = toTank(e));
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove', e => {
+  const p = toTank(e);
+  if (dragging) push(p.x, p.y, p.x - lastX, p.y - lastY);
+  lastX = p.x; lastY = p.y;
+});
+canvas.addEventListener('pointerup',     () => { dragging = false; });
+canvas.addEventListener('pointercancel', () => { dragging = false; });
+
+let running = true, stepOnce = false;
+$('bPause').addEventListener('click', function(){
+  running = !running;
+  this.textContent = running ? 'Pause' : 'Play';
+});
+$('bStep').addEventListener('click', () => { stepOnce = true; });
+$('bStir').addEventListener('click', stir);
+$('bReset').addEventListener('click', () => {
+  for (const a of [u, v, fu, fv]) a.fill(0);
+});
+
+/* THE MAIN LOOP, once per animation frame.
+
+   The force is drawn AFTER the step that used it and cleared just before the
+   next one, so each frame shows the push and the velocity it produced side by
+   side. While paused, no step runs, so the force keeps building up (and
+   stays drawn) until you press Step or Play. */
+function frame(){
+  const advance = running || stepOnce;
+  stepOnce = false;
+  if (advance) velStep();
+  render();
+  measure();
+  if (advance){ fu.fill(0); fv.fill(0); }
+  requestAnimationFrame(frame);
+}
+
+resize();
+stir();
+frame();
+</script>
+</body>
+</html>
