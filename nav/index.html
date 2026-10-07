@@ -95,12 +95,102 @@ document.addEventListener('fullscreenchange', function(){
   document.getElementById('bFull').textContent = document.fullscreenElement ? 'Exit' : 'Maximise';
 });
 
-/* ---------- left: stable fluids ---------- */
+/* ---------- left: stable fluids ----------
+
+   WHAT THE NAVIER-STOKES EQUATIONS SAY
+
+   The fluid is described by a velocity field u(x,y,t): at every point of the
+   tank, and at every instant, there is an arrow saying which way the fluid is
+   moving and how fast. Navier-Stokes is just Newton's F = ma written for that
+   field of arrows, once for each point:
+
+       du/dt  =  -(u . grad)u  -  grad(p)  +  nu * lap(u)  +  f      ... (1)
+       div(u) =  0                                                   ... (2)
+
+   Reading the symbols (all of them are ordinary calculus, applied one
+   direction at a time):
+
+     du/dt      how the velocity at a fixed point changes from instant to
+                instant. This is the "a" in F = ma; density is taken as 1, so
+                the right-hand side is just the sum of the forces.
+
+     grad(q)    the "slope vector" of a quantity q: (dq/dx, dq/dy). It points
+                uphill, in the direction q increases fastest.
+
+     div(u)     dU/dx + dV/dy, where u = (U,V). It measures how much fluid is
+                spreading out of a point: positive means the point is a source
+                (more leaves than arrives), negative means a sink.
+
+     lap(u)     d2U/dx2 + d2U/dy2, the second derivative in space. For a
+                bumpy field it is negative at a peak and positive in a dip, so
+                it always pulls a value back toward the average of its
+                neighbours - it is the smoothing operator.
+
+   Term by term, equation (1) says the velocity at a point changes because:
+
+     -(u . grad)u   ADVECTION. The fluid carries its own velocity along with
+                    it, the way a river carries a leaf. This is the only
+                    nonlinear term (u appears twice, multiplied by itself) and
+                    it is what makes fluids hard: fast flow moves velocity
+                    around faster, which can make it faster still. This term
+                    is the reason the Navier-Stokes existence-and-smoothness
+                    problem is still open, and it is what the right-hand panel
+                    is about.
+
+     -grad(p)       PRESSURE. Fluid accelerates from high pressure toward low
+                    pressure - downhill on the pressure landscape. Note that
+                    equation (1) never says what p is; p is whatever it has to
+                    be to keep equation (2) true.
+
+     nu * lap(u)    VISCOSITY. Internal friction. Neighbouring parcels of
+                    fluid drag on each other, so velocity diffuses and smooths
+                    out. nu (the slider) is how sticky the fluid is: nu near 0
+                    is like air, large nu is like honey.
+
+     f              EXTERNAL FORCE. Here, your mouse - see push().
+
+   Equation (2) is INCOMPRESSIBILITY: water cannot be squashed, so whatever
+   flows into a small region must flow out again, so the divergence is zero
+   everywhere. The readout marked "div.u" shows how close to zero we are; a
+   perfect simulation would sit at 0.00.
+
+   HOW THE CODE SOLVES IT
+
+   There is no formula for u(x,y,t), so we approximate. Two approximations:
+
+     1. Space is chopped into an N x N grid of cells; u[] and v[] store the two
+        velocity components at the centre of each cell. Derivatives become
+        differences between neighbouring cells - e.g. dU/dx at cell i is about
+        (u[i+1] - u[i-1]) / (2h), where h = 1/N is the cell width.
+
+     2. Time advances in fixed steps dt. Instead of applying all four terms of
+        (1) at once, each step applies them one after another to the whole
+        grid - a "splitting" method. One trip through velStep() does:
+
+             add force f   ->   diffuse (viscosity)   ->   project (pressure)
+             ->   advect   ->   project (pressure) again
+
+        Each stage is one term of the equation, and the checkboxes let you
+        switch a term off to see what it was doing. This is Jos Stam's "Stable
+        Fluids" scheme (1999); its selling point is that it never explodes,
+        however big dt is, which is why the tank stays well-behaved while you
+        scribble in it.
+
+   The arrays: u,v are the current velocity field. u0,v0 are scratch space that
+   holds the previous field (or the accumulated force, or the pressure) - the
+   code swaps them around rather than allocating new arrays each frame.
+*/
 (function(){
+/* N x N interior cells, plus a one-cell ring of "ghost" cells around the edge
+   that holds the wall conditions, so the arrays are (N+2) x (N+2). ITER is how
+   many passes the pressure/viscosity equation solver makes. */
 var N = 110, W1 = N + 2, SZ = W1 * W1, ITER = 16;
+/* The grid is stored as one flat array; IX turns a column,row pair into an
+   index. So a cell's four neighbours are at id-1, id+1, id-W1, id+W1. */
 function IX(i,j){ return i + W1 * j; }
 var u = new Float32Array(SZ), v = new Float32Array(SZ);
 var u0 = new Float32Array(SZ), v0 = new Float32Array(SZ);
+/* visc is nu, the viscosity in equation (1). dt is the length of one time step. */
 var visc = 0.00002, dt = 0.11;
 
 var cAdv = document.getElementById('cAdv'), cDif = document.getElementById('cDif'),
@@ -108,6 +198,9 @@ var cAdv = document.getElementById('cAdv'), cDif = document.getElementById('cDif
     oDiv = document.getElementById('oDiv'), oSpdF = document.getElementById('oSpdF'),
     sVisc = document.getElementById('sVisc'), oVisc = document.getElementById('oVisc');
 
+/* The slider sets nu. Useful viscosities span several powers of ten, so the
+   slider position is used as an exponent rather than as the value itself:
+   position 0 -> nu = 0 (no friction at all), position 100 -> nu ~ 0.0025. */
 function readVisc(){
   var t = sVisc.value/100;
   visc = t === 0 ? 0 : 0.000001*Math.pow(10, t*3.4);
@@ -116,6 +209,21 @@ function readVisc(){
 sVisc.addEventListener('input', readVisc);
 readVisc();
 
+/* BOUNDARY CONDITIONS - the walls of the tank.
+
+   A differential equation only has one answer once you say what happens at the
+   edges. Physically the tank has solid walls: fluid cannot flow through them.
+   So the ghost cell just outside a wall is filled in to force that:
+
+     b === 1  the array is the horizontal velocity U, and this is a left/right
+              wall, so copy the neighbour with the sign flipped. The average of
+              x and -x is 0, so the flow across the wall is zero: it bounces.
+     b === 2  same thing for the vertical velocity V at the top/bottom walls.
+     b === 0  the array is a scalar (pressure, divergence). Nothing to reflect,
+              so copy the neighbour unchanged - "no gradient across the wall".
+
+   Corner cells have no single neighbour, so they take the average of the two.
+   Every stage below calls this at the end, otherwise the edges would leak. */
 function setBnd(b, x){
   for (var i = 1; i <= N; i++){
     x[IX(0,i)]   = b === 1 ? -x[IX(1,i)] : x[IX(1,i)];
@@ -128,70 +236,239 @@ function setBnd(b, x){
   x[IX(N+1,0)]   = 0.5*(x[IX(N,0)]   + x[IX(N+1,1)]);
   x[IX(N+1,N+1)] = 0.5*(x[IX(N,N+1)] + x[IX(N+1,N)]);
 }
+/* SOLVING FOR A FIELD THAT DEPENDS ON ITS OWN NEIGHBOURS.
+
+   Both the viscosity step and the pressure step end up asking the same kind of
+   question: find a value in every cell such that each cell equals some known
+   quantity plus a share of its four neighbours,
+
+       x[cell] * c  =  xs[cell]  +  a * (sum of x at the four neighbours)
+
+   You cannot just evaluate that left to right, because every cell's answer
+   depends on cells you have not worked out yet. It is one giant simultaneous
+   equation - N*N unknowns, far too many to solve exactly at 60 frames a
+   second.
+
+   Instead, guess and iterate (Gauss-Seidel relaxation). Start from whatever is
+   in x, sweep the grid rearranging the formula to give a better x for each
+   cell, fix the walls, and repeat ITER times. The values settle toward the
+   true answer. 16 sweeps is nowhere near converged, but it is close enough to
+   look right - the honest trade this whole simulation makes.
+
+   Note the sweep is IN PLACE, so within one pass x[id-1] and x[id-W1] have
+   already been updated this sweep while x[id+1] and x[id+W1] are still from
+   the last one. Each cell therefore uses a mix of new and old neighbours.
+   That is deliberate: the fresher values propagate immediately down and to
+   the right, so one sweep carries information across the whole grid in the
+   sweep direction (and only one cell against it).
+
+   The alternative is Jacobi iteration: read every neighbour from a frozen
+   copy of the previous sweep, write into a second array, swap at the end.
+   That is symmetric and order-independent, but it converges about half as
+   fast - measured on this grid, Jacobi needs 32 sweeps to reach what
+   Gauss-Seidel reaches in 16 - and it costs an extra buffer. Gauss-Seidel
+   wins on one CPU thread. Jacobi wins the moment you go parallel, because
+   every cell can be computed independently, which is why GPU fluid solvers
+   almost always use it. Red-black Gauss-Seidel (update chequerboard-style in
+   two passes) gets both, if you ever need it.
+
+   The asymmetry does bias the result slightly toward the sweep direction.
+   At 16 sweeps, in a tank of drifting dye, it is invisible.
+
+   a and c are the coefficients; they are set differently for viscosity and for
+   pressure, see velStep() and project(). */
 function linSolve(b, x, xs, a, c){
   var invc = 1/c, i, j, k, id;
   for (k = 0; k < ITER; k++){
     for (j = 1; j <= N; j++){
       for (i = 1; i <= N; i++){
         id = IX(i,j);
+        /* x[id-1], x[id+1], x[id-W1], x[id+W1] are the left, right, upper and
+           lower neighbours - the discrete Laplacian's four-point stencil. */
         x[id] = (xs[id] + a*(x[id-1] + x[id+1] + x[id-W1] + x[id+W1])) * invc;
       }
     }
     setBnd(b, x);
   }
 }
+/* ADVECTION - the -(u . grad)u term, the "fluid carries itself" one.
+   Checkbox: Advection.
+
+   The obvious approach is to push each cell's value forward along the flow,
+   but that scatters values between cells and blows up when dt is large. Stam's
+   trick is to run time BACKWARDS instead, and it is the reason this simulation
+   never explodes:
+
+     For cell (i,j), ask: one time step ago, where was the fluid that has just
+     arrived here? Answer: at (i,j) minus velocity * dt. Go to that spot in the
+     old field d0 and copy whatever value was there.
+
+   That spot almost never lands exactly on a cell centre, so the value is
+   read out with bilinear interpolation - a weighted average of the four cells
+   surrounding it, weights s0,s1 across and t0,t1 down. (s1 is how far past the
+   left cell the point sits, so s0 = 1 - s1 is the left cell's share.)
+
+   Because every new value is an average of old values, it can never exceed the
+   largest old value. Nothing can grow without bound; worst case the picture
+   gets blurry. That is the whole reason the solver is called "stable".
+
+   dt0 = dt*N converts a velocity in tank-widths-per-second into a distance in
+   grid cells. The clamps to [0.5, N+0.5] stop a fast flow from reaching for a
+   cell outside the grid. */
 function advect(b, d, d0, uu, vv){
   var dt0 = dt * N, i, j;
   for (j = 1; j <= N; j++){
     for (i = 1; i <= N; i++){
       var id = IX(i,j);
+      /* step backwards down the velocity arrow to find where this came from */
       var x = i - dt0*uu[id], y = j - dt0*vv[id];
       if (x < 0.5) x = 0.5; if (x > N + 0.5) x = N + 0.5;
       if (y < 0.5) y = 0.5; if (y > N + 0.5) y = N + 0.5;
+      /* i0,j0 = the cell that point lands in; s,t = the fractional part */
       var i0 = x|0, j0 = y|0, s1 = x - i0, s0 = 1 - s1, t1 = y - j0, t0 = 1 - t1;
+      /* blend the four cells around that point, weighted by how near each is */
       d[id] = s0*(t0*d0[IX(i0,j0)] + t1*d0[IX(i0,j0+1)]) + s1*(t0*d0[IX(i0+1,j0)] + t1*d0[IX(i0+1,j0+1)]);
     }
   }
   setBnd(b, d);
 }
+/* PRESSURE - the -grad(p) term, and the way equation (2) is enforced.
+   Checkbox: Pressure.
+
+   After the force, viscosity and advection stages, the velocity field is
+   wrong: it has cells acting as sources and sinks, div(u) != 0, so fluid is
+   appearing and vanishing. Water does not do that. The pressure term's only
+   job is to fix it. Turn the checkbox off and watch the particles pile up and
+   thin out instead of swirling - that is a compressible mess.
+
+   The mathematical fact this rests on (the Helmholtz decomposition) is that
+   ANY velocity field can be split into exactly two parts:
+
+       (what we have)  =  (a divergence-free swirl)  +  grad(p)
+
+   The swirl is the physically legal flow we want to keep. So compute p, then
+   subtract grad(p), and what is left is guaranteed divergence-free. This is
+   called a "projection" for the same reason as in vectors: it drops the
+   component pointing in the illegal direction, keeping only the legal part.
+
+   Three steps below:
+
+     1. Measure the problem. div = -h * div(u), using centred differences:
+        dU/dx is about (U at i+1 - U at i-1)/2h, and likewise dV/dy. The factor
+        of h and the minus sign are folded in here so that step 2 can use tidy
+        coefficients.
+
+     2. Find p. Taking the divergence of the split above gives Poisson's
+        equation, lap(p) = div(u): the pressure whose smoothing-operator value
+        matches the divergence we measured. Discretised, that is exactly the
+        neighbour-average problem linSolve handles, with a = 1 and c = 4
+        (four neighbours). So the pressure is not an independent variable with
+        its own physics here - it is solved for, purely as the field that
+        cancels the divergence.
+
+     3. Subtract grad(p) from the velocity: each cell accelerates from high
+        pressure toward low. Where fluid was piling up, pressure is high and
+        this pushes it apart; where it was thinning out, this pulls it back.
+
+   p and div are passed in as the scratch arrays u0 and v0 - the previous
+   velocity has already been used by this point in velStep(). */
 function project(uu, vv, p, div){
   var i, j, h = 1/N;
   for (j = 1; j <= N; j++) for (i = 1; i <= N; i++){
+    /* 1. how badly does each cell violate div(u) = 0? */
     div[IX(i,j)] = -0.5*h*(uu[IX(i+1,j)] - uu[IX(i-1,j)] + vv[IX(i,j+1)] - vv[IX(i,j-1)]);
     p[IX(i,j)] = 0;
   }
   setBnd(0, div); setBnd(0, p);
+  /* 2. solve lap(p) = div(u) for the pressure */
   linSolve(0, p, div, 1, 4);
   for (j = 1; j <= N; j++) for (i = 1; i <= N; i++){
+    /* 3. u <- u - grad(p): flow downhill on the pressure landscape */
     uu[IX(i,j)] -= 0.5*(p[IX(i+1,j)] - p[IX(i-1,j)])/h;
     vv[IX(i,j)] -= 0.5*(p[IX(i,j+1)] - p[IX(i,j-1)])/h;
   }
   setBnd(1, uu); setBnd(2, vv);
 }
+/* ONE TIME STEP OF NAVIER-STOKES.
+
+   This is the whole equation, assembled. Rather than applying all four terms
+   of (1) at once, each is applied in turn to the result of the last - so over
+   one step of length dt the velocity field receives every effect exactly once.
+   Reading top to bottom is reading the equation left to right.
+
+   The u/u0 swaps are just double-buffering: several stages need to read a
+   complete "before" field while writing a complete "after" field, so the two
+   arrays trade roles instead of being copied. After a swap, u0 holds the
+   input and u is where the answer goes. */
 function velStep(){
   var i, t;
+
+  /* TERM f - external force. u0,v0 currently hold the force accumulated by
+     push() since the last frame; du/dt = f integrates to u += dt*f. */
   for (i = 0; i < SZ; i++){ u[i] += dt*u0[i]; v[i] += dt*v0[i]; }
+
+  /* TERM nu*lap(u) - viscosity, applied to each velocity component in turn.
+
+     The naive version, u_new = u_old + dt*nu*lap(u_old), explodes if dt or nu
+     is large: a cell overshoots past its neighbours' average, then overshoots
+     back further, oscillating wildly. So solve it IMPLICITLY instead - demand
+     a new field that, if you diffused it backwards by one step, would give the
+     old one:
+
+         u_new - dt*nu*lap(u_new) = u_old
+
+     Every cell now depends on its neighbours, which is exactly linSolve's
+     problem, with a = dt*nu*N*N (the N*N converts nu into grid-cell units,
+     since lap involves 1/h^2 and h = 1/N) and c = 1 + 4a. This version is
+     stable for any dt: it can only ever smooth, never overshoot.
+
+     Unchecked, u.set(u0) copies the field through untouched - an inviscid
+     ("perfect", frictionless) fluid, the nu = 0 case, which is the Euler
+     equation rather than Navier-Stokes. */
   t = u0; u0 = u; u = t;
   if (cDif.checked){ var a = dt*visc*N*N; linSolve(1, u, u0, a, 1 + 4*a); } else u.set(u0);
   t = v0; v0 = v; v = t;
   if (cDif.checked){ var a2 = dt*visc*N*N; linSolve(2, v, v0, a2, 1 + 4*a2); } else v.set(v0);
+
+  /* TERM -grad(p) - clean up the divergence the force and viscosity left,
+     so that advection is carrying the flow along a field that conserves mass */
   if (cPrj.checked) project(u, v, u0, v0);
+
+  /* TERM -(u . grad)u - the flow carries its own velocity along. Both
+     components must be advected by the SAME field, so the pre-advection
+     velocity is swapped into u0,v0 and used as the transport field for both
+     calls (note u0,v0 appear as the last two arguments each time). */
   if (cAdv.checked){
     t = u0; u0 = u; u = t;
     t = v0; v0 = v; v = t;
     advect(1, u, u0, u0, v0);
     advect(2, v, v0, u0, v0);
   }
+
+  /* -grad(p) again: advection has just reshuffled the velocities, which
+     reintroduces divergence, so project a second time. The field the renderer
+     finally sees is the one that came out of a projection - so it satisfies
+     equation (2) to within the accuracy of 16 linSolve sweeps. */
   if (cPrj.checked) project(u, v, u0, v0);
+
+  /* Not physics - a safety net. Turning terms off mid-flow (especially
+     pressure) can leave the field genuinely unphysical, so clamp the speed and
+     scrub any NaN/Infinity rather than letting one bad cell poison the grid. */
   for (i = 0; i < SZ; i++){
     if (!isFinite(u[i])) u[i] = 0;
     if (!isFinite(v[i])) v[i] = 0;
     if (u[i] > 60) u[i] = 60; else if (u[i] < -60) u[i] = -60;
     if (v[i] > 60) v[i] = 60; else if (v[i] < -60) v[i] = -60;
   }
+  /* force has been spent; clear the accumulator ready for the next frame */
   u0.fill(0); v0.fill(0);
 }
 
+/* The particles are only paint. They carry no physics and do not affect the
+   velocity field at all - they are massless tracers dropped in so the
+   invisible field u(x,y,t) becomes visible, the way dye or smoke is used in a
+   real experiment. They are colour-banded by starting column so you can watch
+   advection fold and stretch the bands together. */
 var NP = 3200, px = new Float32Array(NP), py = new Float32Array(NP),
     pb = new Uint8Array(NP), pl = new Float32Array(NP), BINS = 8, binColor = [];
 for (var b = 0; b < BINS; b++){
@@ -201,6 +478,9 @@ for (var b = 0; b < BINS; b++){
 function seed(k){ px[k] = Math.random(); py[k] = Math.random(); pb[k] = Math.min(BINS-1,(px[k]*BINS)|0); pl[k] = 6 + Math.random()*10; }
 for (var k0 = 0; k0 < NP; k0++) seed(k0);
 
+/* Read the field f at any point of the tank, not just at a cell centre, by
+   bilinear interpolation between the four surrounding cells - the same
+   averaging advect() uses. x,y are in 0..1 tank coordinates. */
 function sample(f, x, y){
   var gx = x*N + 0.5, gy = y*N + 0.5;
   if (gx < 0.5) gx = 0.5; if (gx > N + 0.5) gx = N + 0.5;
@@ -224,10 +504,27 @@ function resize(){
 }
 new ResizeObserver(resize).observe(cv.parentNode);
 
+/* VORTICITY (curl), the checkbox that tints the background.
+
+   Divergence asks how much fluid is spreading out of a point; vorticity asks
+   how much it is SPINNING there:
+
+       curl(u) = dV/dx - dU/dy
+
+   Picture a tiny paddle wheel dropped in the flow. If the vertical velocity
+   grows as you move right, or the horizontal velocity grows as you move down,
+   the wheel turns. Positive curl is anticlockwise (drawn warm/red here),
+   negative is clockwise (cool/blue), zero is the background colour.
+
+   Vorticity is where the interesting behaviour of a fluid lives - and it is
+   what the right-hand panel tracks, because the open Navier-Stokes problem is
+   essentially the question of whether vorticity can become infinite in finite
+   time. curl/60 scales it into -1..1 for the colour ramp. */
 function drawVort(){
   var d = vimg.data, i, j;
   for (j = 0; j < N; j++) for (i = 0; i < N; i++){
     var id = IX(i+1, j+1);
+    /* centred differences again: dV/dx - dU/dy, times N for the 1/h */
     var curl = (v[id+1] - v[id-1] - u[id+W1] + u[id-W1])*0.5*N;
     var t = Math.max(-1, Math.min(1, curl/60)), o = (j*N + i)*4;
     d[o] = 8 + (t > 0 ? t*200 : 0); d[o+1] = 21 + Math.abs(t)*40; d[o+2] = 27 + (t < 0 ? -t*210 : 0); d[o+3] = 255;
@@ -247,6 +544,11 @@ function render(){
     ctx.fill();
   }
 }
+/* Float each tracer along the flow: position += velocity-at-that-position * dt.
+   This is the definition of the velocity field being acted out - a particle
+   goes wherever the arrow under it points. Particles also expire (pl is a
+   lifetime) and get reseeded, so the picture keeps refreshing instead of all
+   the dye ending up trapped in one eddy. */
 function moveParticles(){
   for (var k = 0; k < NP; k++){
     px[k] += sample(u, px[k], py[k])*dt;
@@ -255,6 +557,17 @@ function moveParticles(){
     if (pl[k] <= 0 || px[k] < 0 || px[k] > 1 || py[k] < 0 || py[k] > 1) seed(k);
   }
 }
+/* The two readouts under the tank.
+
+   div.u is the root-mean-square of div(u) over the grid: square every cell's
+   divergence, average, square-root. Squaring first stops positive and negative
+   errors cancelling out and hiding the problem. Equation (2) says this should
+   be 0; with Pressure ticked it stays near zero, and it turns orange past 3.
+   Untick Pressure and watch it climb - that is mass conservation failing.
+
+   ||u|| is the largest speed anywhere on the grid, sqrt(U^2 + V^2). Sampling
+   every second cell is a speed optimisation; it is a display value, not
+   physics. */
 function measure(){
   var acc = 0, n = 0, mx = 0, i, j;
   for (j = 2; j <= N-1; j += 2) for (i = 2; i <= N-1; i += 2){
@@ -275,6 +588,17 @@ function toGrid(e){
   var r = cv.getBoundingClientRect();
   return { x: (e.clientX - r.left - ox)/S, y: (e.clientY - r.top - oy)/S };
 }
+/* TERM f - the external force, i.e. you.
+
+   dx,dy is how far the pointer moved since the last event, which stands in for
+   the direction and strength of the shove. The force is written into u0,v0,
+   the accumulator that velStep() will integrate at the start of the next step.
+
+   The push is spread over a 5x5 patch with Gaussian weights, w = e^(-r^2/4),
+   strongest at the centre and fading with distance. A force applied to a
+   single cell would be a spike the grid cannot represent - it would just
+   produce noise that the pressure step immediately fights. A smooth blob
+   behaves like a real finger dragged through water. */
 function push(x, y, dx, dy){
   if (x < 0 || x > 1 || y < 0 || y > 1) return;
   var gi = Math.round(x*N) + 1, gj = Math.round(y*N) + 1, F = 900;
@@ -295,6 +619,9 @@ cv.addEventListener('pointermove', function(e){
 cv.addEventListener('pointerup', function(){ pdown = false; });
 cv.addEventListener('pointercancel', function(){ pdown = false; });
 
+/* Apply force at 40 points around a circle, each tangent to it (the direction
+   (-sin a, cos a) is perpendicular to the radius (cos a, sin a)), which spins
+   up a single clean vortex to start from. */
 function stir(){
   for (var k = 0; k < 40; k++){
     var a = k/40*6.2832;
@@ -310,6 +637,8 @@ document.getElementById('bReset').addEventListener('click', function(){
 
 resize();
 stir();
+/* The main loop, once per animation frame: advance the physics by one dt,
+   float the tracers along the new field, draw, update the readouts. */
 (function loop(){ velStep(); moveParticles(); render(); measure(); requestAnimationFrame(loop); })();
 })();
 
