@@ -38,16 +38,17 @@
 <section>
   <h2>Push the fluid, watch the velocity field
     <small>white arrow = velocity in a cell · <span class="key-force">orange arrow = your force this step</span> · lengths are relative to the largest</small></h2>
-  <div class="stage"><canvas id="tank" aria-label="Velocity grid. Drag to push the fluid."></canvas></div>
+  <div class="stage"><canvas id="tank" aria-label="Velocity grid. Move the pointer over it to push the fluid."></canvas></div>
   <div class="bar">
     <label class="chk"><input type="checkbox" id="cAdv" checked />Advection</label>
     <label class="chk"><input type="checkbox" id="cDif" checked />Viscosity</label>
     <label class="chk"><input type="checkbox" id="cPrj" checked />Pressure</label>
+    <button id="bView" style="min-width:170px" title="Cycle views (V)">View: Field</button>
     <button id="bPause" style="min-width:70px">Pause</button>
     <button id="bStep">Step</button>
     <button id="bStir">Stir</button>
     <button id="bReset">Reset</button>
-    <label class="chk" style="flex:1;min-width:150px">ν <input type="range" id="sVisc" min="0" max="100" step="1" value="20" aria-label="Viscosity" /><span class="num" id="oVisc">0.000020</span></label>
+    <label class="chk" style="flex:1;min-width:150px">Viscosity ν <input type="range" id="sVisc" min="0" max="100" step="1" value="75" aria-label="Viscosity" /><span class="num" id="oVisc">0.000355</span></label>
     <span>∇·u <span class="num" id="oDiv">0.00</span></span>
     <span>‖u‖ <span class="num" id="oSpd">0.0</span></span>
   </div>
@@ -55,14 +56,32 @@
 
 <script>
 /* A stripped-down version of the left panel of index.html. Same solver, but
-   instead of floating tracer particles through the flow, every grid cell is
-   drawn directly: its colour is its speed and its arrow is its velocity
-   vector. The force you add by dragging is drawn as an orange arrow in the
-   cells it lands on, so you can see a push go in and then watch the
-   pressure, viscosity and advection stages spread it to the neighbours.
+   every grid cell is drawn directly: its colour is its speed and its arrow is
+   its velocity vector. The force you add by moving the mouse is drawn as an orange
+   arrow in the cells it lands on, so you can see a push go in and then watch
+   the pressure, viscosity and advection stages spread it to the neighbours.
+   Tracer particles can be layered on top (the View button, or the V key) to
+   compare the field with what it does to things floating in it.
 
-   Pause, then drag: the force is held (orange) without being applied. Press
+   Pause, then move the mouse: the force is held (orange) without being applied. Press
    Step to run exactly one time step and see what it does to the white arrows.
+
+   HOW THIS FILE IS ORGANISED - one <script> block per part, and each only
+   uses the parts above it:
+
+     1. FLUID       the simulation: the velocity grid and velStep(). Knows
+                    nothing about the screen. Its outward-facing functions are
+                    velStep(), push(), stir(), reset() and velocityAt().
+     2. SCREEN      the canvas and the mapping from tank units to pixels.
+     3. FIELD VIEW  draws the grid: cell colours and arrows. Reads u, v, fu, fv.
+     4. PARTICLES   a separate little simulation of massless tracers. It only
+                    talks to the fluid through velocityAt() - it never touches
+                    the grid arrays, and the fluid never knows it exists.
+     5. APP         buttons, view modes, readouts and the main loop: the only
+                    part that calls the others.
+
+   Everything is plain top-level `const`/`let`/`function`, which classic
+   <script> blocks on one page share, so no import/export is needed.
 
    WHAT THE NAVIER-STOKES EQUATIONS SAY
 
@@ -129,6 +148,10 @@
         big dt is.
 */
 
+/* =====================================================================
+   1. FLUID - the velocity field and how it evolves. No drawing in here.
+   ===================================================================== */
+
 /* ---------------- the grid ---------------- */
 
 /* N x N cells that hold the fluid, plus a one-cell ring of "ghost" cells all
@@ -140,7 +163,7 @@ const W = N + 2;          // row width, including the two ghost cells
 const SIZE = W * W;
 const ITER = 16;          // sweeps of the iterative solver, see linSolve()
 const dt = 0.11;          // length of one time step
-let visc = 0.00002;       // nu, the viscosity
+let visc = 0.000355;      // nu, the viscosity (the app overwrites this from its slider)
 
 /* The grid is one flat array, stored row after row. IX turns (column, row)
    into an index, so a cell's four neighbours are at id-1, id+1, id-W, id+W. */
@@ -323,8 +346,11 @@ function project(){
 /* ONE TIME STEP OF NAVIER-STOKES - the whole of equation (1), one term at a
    time. Reading top to bottom is reading the equation. Where a stage needs
    the complete "before" field while it writes the "after" field, the before
-   is copied into u0,v0 first. */
-function velStep(){
+   is copied into u0,v0 first.
+
+   `terms` says which terms are switched on, e.g.
+   { viscosity: true, pressure: true, advection: false } - the checkboxes. */
+function velStep(terms){
   /* f: du/dt = f integrates to u += dt * f */
   for (let i = 0; i < SIZE; i++){
     u[i] += dt * fu[i];
@@ -332,7 +358,7 @@ function velStep(){
   }
 
   /* nu * lap(u) */
-  if (cDif.checked){
+  if (terms.viscosity){
     u0.set(u); v0.set(v);
     diffuse(HORIZONTAL, u, u0);
     diffuse(VERTICAL, v, v0);
@@ -340,11 +366,11 @@ function velStep(){
 
   /* -grad(p), first time: clean up the divergence the force and viscosity
      left, so advection carries the flow along a field that conserves mass */
-  if (cPrj.checked) project();
+  if (terms.pressure) project();
 
   /* -(u . grad)u: both components are carried by the SAME, pre-advection
      velocity, which is why u0,v0 are the last two arguments both times */
-  if (cAdv.checked){
+  if (terms.advection){
     u0.set(u); v0.set(v);
     advect(HORIZONTAL, u, u0, u0, v0);
     advect(VERTICAL,   v, v0, u0, v0);
@@ -352,7 +378,7 @@ function velStep(){
 
   /* -grad(p), second time: advection's interpolation reintroduces some
      divergence, so project again. What gets drawn has just been projected. */
-  if (cPrj.checked) project();
+  if (terms.pressure) project();
 
   /* Not physics - a safety net. With Pressure off the field can get wild, so
      clamp the speed and scrub any NaN rather than let one cell poison all. */
@@ -401,25 +427,61 @@ function stir(){
   }
 }
 
-/* ---------------- drawing ---------------- */
+/* Back to a still tank: no velocity, no pending force. */
+function reset(){
+  for (const a of [u, v, fu, fv]) a.fill(0);
+}
+
+/* The velocity at any point (x, y) of the tank, in 0..1 tank units - not just
+   at a cell centre. This is the fluid's one window for anything that wants
+   to ride the flow. Cell (i, j)'s centre is at tank position ((i - 0.5)/N,
+   (j - 0.5)/N), so tank x maps to cell coordinate x*N + 0.5; from there it is
+   the same bilinear interpolation advect() uses. */
+function velocityAt(x, y){
+  const cx = clamp(x * N + 0.5, 0.5, N + 0.5);
+  const cy = clamp(y * N + 0.5, 0.5, N + 0.5);
+  return { vx: sampleAt(u, cx, cy), vy: sampleAt(v, cx, cy) };
+}
+</script>
+
+
+<script>
+/* =====================================================================
+   2. SCREEN - the canvas, and where the square tank sits inside it.
+   ===================================================================== */
 
 const canvas = document.getElementById('tank'), ctx = canvas.getContext('2d');
 let size = 300, gridLeft = 0, gridTop = 0;   // the square drawing area, in CSS pixels
+let screenW = 300, screenH = 300;            // the whole canvas, in CSS pixels
 const dpr = Math.min(2, window.devicePixelRatio || 1);
 
 function resize(){
   const r = canvas.parentNode.getBoundingClientRect();
-  canvas.width = r.width * dpr; canvas.height = r.height * dpr;
+  screenW = r.width; screenH = r.height;
+  canvas.width = screenW * dpr; canvas.height = screenH * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  size = Math.min(r.width, r.height);
-  gridLeft = (r.width - size) / 2; gridTop = (r.height - size) / 2;
+  size = Math.min(screenW, screenH);
+  gridLeft = (screenW - size) / 2; gridTop = (screenH - size) / 2;
 }
 new ResizeObserver(resize).observe(canvas.parentNode);
 
+function clearScreen(){
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#060F13';
+  ctx.fillRect(0, 0, screenW, screenH);
+}
+</script>
+
+
+<script>
+/* =====================================================================
+   3. FIELD VIEW - draws the grid itself. Reads the fluid's arrays, never
+      writes them.
+   ===================================================================== */
+
 /* Speeds range from 0 to ~60, but most of the interesting ones are under 5.
    1 - e^(-x/ref) maps 0..infinity onto 0..1, roughly linear for small x and
-   flattening for big ones, so slow cells still get a visible arrow and fast
-   ones do not overflow their cell. */
+   flattening for big ones. Used for the cell colours. */
 function squash(x, ref){ return 1 - Math.exp(-x / ref); }
 
 /* The largest vector (x[id], y[id]) anywhere on the grid. */
@@ -466,9 +528,9 @@ function arrow(cx, cy, vx, vy, maxLen, biggest){
   ctx.fill();
 }
 
-function render(){
-  const r = canvas.parentNode.getBoundingClientRect();
-  ctx.fillStyle = '#060F13'; ctx.fillRect(0, 0, r.width, r.height);
+/* Draw the whole field. `opacity` (0..1) lets the particles show through. */
+function drawField(opacity){
+  ctx.globalAlpha = opacity;
   const cell = size / N;
   const cellX = i => gridLeft + (i - 1) * cell;   // grid column -> screen x of its left edge
   const cellY = j => gridTop  + (j - 1) * cell;
@@ -505,6 +567,120 @@ function render(){
       arrow(cellX(i) + cell / 2, cellY(j) + cell / 2, u[IX(i, j)], v[IX(i, j)], cell * 1.0, biggestVelocity);
     }
   }
+  ctx.globalAlpha = 1;
+}
+</script>
+
+
+<script>
+/* =====================================================================
+   4. PARTICLES - massless tracers, a simulation of their own.
+
+   They carry no physics and do not affect the fluid at all - they are dropped
+   in so the flow becomes visible the way dye or smoke is in a real
+   experiment. The only thing they know about the fluid is velocityAt().
+
+   They are colour-banded by the column they start in, so you can watch
+   advection fold and stretch the bands into each other.
+   ===================================================================== */
+
+const PARTICLE_COUNT = 3200, BANDS = 8;
+const particles = [];   // each is { x, y, band, life } - x, y in 0..1 tank units
+
+/* teal on the left through to amber on the right */
+const bandColour = [];
+for (let b = 0; b < BANDS; b++){
+  const m = b / (BANDS - 1);
+  bandColour.push(`rgb(${86 + 156 * m}, ${199 - 38 * m}, ${224 - 161 * m})`);
+}
+
+/* Put a particle somewhere random, with a random lifetime in time units. */
+function seedParticle(p){
+  p.x = Math.random();
+  p.y = Math.random();
+  p.band = Math.min(BANDS - 1, Math.floor(p.x * BANDS));
+  p.life = 6 + Math.random() * 10;
+}
+
+function resetParticles(){
+  particles.length = 0;
+  for (let k = 0; k < PARTICLE_COUNT; k++){
+    const p = {};
+    seedParticle(p);
+    particles.push(p);
+  }
+}
+
+/* Float each tracer along the flow for one step of length dt:
+   position += velocity-at-that-position * dt. That is the definition of a
+   velocity field acted out - a particle goes wherever the arrow under it
+   points. Particles also expire and get reseeded, so the picture keeps
+   refreshing instead of all the dye ending up trapped in one eddy. */
+function moveParticles(dt){
+  for (const p of particles){
+    const { vx, vy } = velocityAt(p.x, p.y);
+    p.x += vx * dt;
+    p.y += vy * dt;
+    p.life -= dt;
+    if (p.life <= 0 || p.x < 0 || p.x > 1 || p.y < 0 || p.y > 1) seedParticle(p);
+  }
+}
+
+/* One small square per particle, batched into one path per colour band
+   because a single fill() of many rects is far cheaper than thousands. */
+function drawParticles(opacity){
+  ctx.globalAlpha = opacity;
+  const dot = Math.max(2, size / 300);
+  for (let b = 0; b < BANDS; b++){
+    ctx.fillStyle = bandColour[b];
+    ctx.beginPath();
+    for (const p of particles){
+      if (p.band === b) ctx.rect(gridLeft + p.x * size - dot / 2, gridTop + p.y * size - dot / 2, dot, dot);
+    }
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+</script>
+
+
+<script>
+/* =====================================================================
+   5. APP - controls, view modes, readouts, and the main loop.
+   ===================================================================== */
+
+const $ = id => document.getElementById(id);
+const cAdv = $('cAdv'), cDif = $('cDif'), cPrj = $('cPrj');
+const oDiv = $('oDiv'), oSpd = $('oSpd'), sVisc = $('sVisc'), oVisc = $('oVisc');
+const bView = $('bView');
+
+/* VIEW MODES. Each says how opaque the field and the particles are; 0 means
+   don't draw it at all. The View button or the V key steps to the next one.
+   The cycle passes through the blended view on the way there and on the way
+   back - it is the same object twice, not a copy - so the sequence is
+   arrows -> blend -> dots -> blend -> arrows. */
+const FIELD_ONLY = { name: 'Field',              field: 1,    particles: 0 };
+const BLENDED    = { name: 'Faded field + dots', field: 0.35, particles: 1 };
+const DOTS_ONLY  = { name: 'Dots',               field: 0,    particles: 1 };
+const VIEWS = [FIELD_ONLY, BLENDED, DOTS_ONLY, BLENDED];
+let view = 0;
+
+function nextView(){
+  view = (view + 1) % VIEWS.length;
+  bView.textContent = 'View: ' + VIEWS[view].name;
+}
+bView.addEventListener('click', nextView);
+document.addEventListener('keydown', e => {
+  if ((e.key === 'v' || e.key === 'V') && !e.ctrlKey && !e.metaKey && !e.altKey) nextView();
+});
+
+/* Draw one frame: field underneath, particles on top, each at the opacity
+   the current view asks for. */
+function render(){
+  const { field: fieldOpacity, particles: particleOpacity } = VIEWS[view];
+  clearScreen();
+  if (fieldOpacity > 0) drawField(fieldOpacity);
+  if (particleOpacity > 0) drawParticles(particleOpacity);
 }
 
 /* The readouts. div.u is the root-mean-square divergence over the grid
@@ -526,12 +702,6 @@ function measure(){
   oSpd.textContent = maxSpeed.toFixed(1);
 }
 
-/* ---------------- controls ---------------- */
-
-const $ = id => document.getElementById(id);
-const cAdv = $('cAdv'), cDif = $('cDif'), cPrj = $('cPrj');
-const oDiv = $('oDiv'), oSpd = $('oSpd'), sVisc = $('sVisc'), oVisc = $('oVisc');
-
 /* The slider is an exponent, because useful viscosities span several powers
    of ten: position 0 -> nu = 0 (frictionless), 100 -> nu ~ 0.0025. */
 function readVisc(){
@@ -542,24 +712,25 @@ function readVisc(){
 sVisc.addEventListener('input', readVisc);
 readVisc();
 
-/* Dragging pushes the fluid; pointer position is converted to 0..1 tank units */
-let dragging = false, lastX = 0, lastY = 0;
+/* Moving the pointer over the tank pushes the fluid - no button needed. Each
+   move pushes by how far the pointer went since the previous move, so the
+   first move after the pointer enters the tank only records where it is:
+   without that, coming in from the far side of the page would count as one
+   huge jump. Pointer position is converted to 0..1 tank units. (On a touch
+   screen there is no hovering, so there it still takes a finger dragged.) */
+const MOUSE_STRENGTH = 0.3;   // 1 = full strength, 0.3 = 30% of it
+let hasLast = false, lastX = 0, lastY = 0;
 function toTank(e){
   const r = canvas.getBoundingClientRect();
   return { x: (e.clientX - r.left - gridLeft) / size, y: (e.clientY - r.top - gridTop) / size };
 }
-canvas.addEventListener('pointerdown', e => {
-  dragging = true;
-  ({ x: lastX, y: lastY } = toTank(e));
-  canvas.setPointerCapture(e.pointerId);
-});
 canvas.addEventListener('pointermove', e => {
   const p = toTank(e);
-  if (dragging) push(p.x, p.y, p.x - lastX, p.y - lastY);
-  lastX = p.x; lastY = p.y;
+  if (hasLast) push(p.x, p.y, (p.x - lastX) * MOUSE_STRENGTH, (p.y - lastY) * MOUSE_STRENGTH);
+  lastX = p.x; lastY = p.y; hasLast = true;
 });
-canvas.addEventListener('pointerup',     () => { dragging = false; });
-canvas.addEventListener('pointercancel', () => { dragging = false; });
+canvas.addEventListener('pointerleave',  () => { hasLast = false; });
+canvas.addEventListener('pointercancel', () => { hasLast = false; });
 
 let running = true, stepOnce = false;
 $('bPause').addEventListener('click', function(){
@@ -568,11 +739,13 @@ $('bPause').addEventListener('click', function(){
 });
 $('bStep').addEventListener('click', () => { stepOnce = true; });
 $('bStir').addEventListener('click', stir);
-$('bReset').addEventListener('click', () => {
-  for (const a of [u, v, fu, fv]) a.fill(0);
-});
+$('bReset').addEventListener('click', () => { reset(); resetParticles(); });
 
 /* THE MAIN LOOP, once per animation frame.
+
+   One step = the fluid advances by dt, then the particles ride the new field
+   for the same dt. The two simulations stay in lockstep only because this
+   loop steps them together; neither calls the other.
 
    The force is drawn AFTER the step that used it and cleared just before the
    next one, so each frame shows the push and the velocity it produced side by
@@ -581,7 +754,10 @@ $('bReset').addEventListener('click', () => {
 function frame(){
   const advance = running || stepOnce;
   stepOnce = false;
-  if (advance) velStep();
+  if (advance){
+    velStep({ advection: cAdv.checked, viscosity: cDif.checked, pressure: cPrj.checked });
+    moveParticles(dt);
+  }
   render();
   measure();
   if (advance){ fu.fill(0); fv.fill(0); }
@@ -589,6 +765,7 @@ function frame(){
 }
 
 resize();
+resetParticles();
 stir();
 frame();
 </script>
