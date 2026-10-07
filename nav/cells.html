@@ -288,10 +288,33 @@ function advect(kind, x, old, carryU, carryV){
   setWalls(kind, x);
 }
 
-/* Bilinear interpolation: the value of field f at a point (x, y) given in
-   cell units. (i0, j0) is the cell to the upper-left of the point; s and t
-   are how far past it the point sits, across and down (0..1). Each of the four
-   cells is weighted by how close the point is to it. */
+/* SAMPLING BETWEEN CELL CENTRES - bilinear interpolation.
+
+   The field only exists at cell centres: u[IX(i, j)] is the velocity at the
+   centre of cell (i, j) and nowhere else, and that is where drawField() puts
+   each arrow. sampleAt() is the rule for what the field is BETWEEN centres.
+
+   The physics needs that, not just the particles. advect() traces each cell
+   back along velocity * dt to where its fluid was one step ago, and that
+   point almost never lands on a centre - at speed 0.3 with dt*N ~ 3.5 it is
+   about 1.05 cells back, somewhere among four centres. Rounding to the
+   nearest cell instead would make slow flow round to "came from right here"
+   and never move, and fast flow jump in whole-cell steps.
+
+   So the value is a blend of the four surrounding centres, each weighted by
+   how close the point is to it:
+
+        (i0,j0) o-----------o (i0+1,j0)
+                |     x     |       x = the point (x, y)
+                |           |
+      (i0,j0+1) o-----------o (i0+1,j0+1)
+
+   (x, y) is in cell units. (i0, j0) is the centre up and to the left of the
+   point; s and t are how far past it the point sits, across and down (0..1).
+   Blend the top pair and the bottom pair across by s, then those two down by t.
+
+   Callers: advect() every step for every cell, and velocityAt(), which is how
+   the particles read the velocity under them. */
 function sampleAt(f, x, y){
   const i0 = Math.floor(x), j0 = Math.floor(y);
   const s = x - i0, t = y - j0;
